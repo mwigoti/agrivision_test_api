@@ -1,7 +1,13 @@
 
 import folium
 
-mapobj = folium.Map(location=[-1.2930392499491719, 36.817867215366086], zoom_start=5)
+mapobj = folium.Map(location=[-1.2930392499491719, 36.817867215366086], zoom_start='stamenterrain')
 
-mapobj
+folium.TileLayer('stamenterrain', attr='stamenterrain').add_to(mapobj)
+
+folium.TileLayer('stamenterrain', attr='stamenterrain').add_to(mapobj)
+
+folium.LayerControl().add_to(mapobj)
+
+mapobj.save('map.html')
 
