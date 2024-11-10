@@ -1,322 +1,281 @@
 import requests
 import json
+import time
+import logging
 from datetime import datetime, timedelta
 import os
-from typing import Dict, Any, Tuple, Optional
+from typing import Dict, Any, Tuple, Optional, List, Union
 import numpy as np
 from dataclasses import dataclass
+from enum import Enum
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+class DataQualityLevel(Enum):
+    """Enumeration for data quality levels"""
+    HIGH = "high"
+    MEDIUM = "medium"
+    LOW = "low"
+    INSUFFICIENT = "insufficient"
 
 @dataclass
 class APIConfig:
-    """Configuration for various APIs"""
+    """Configuration for API access and request handling"""
     OPENWEATHER_API_KEY: str = "2d3d43c07a7fb4e2d3a6dd20ca5073d0"
     NASA_API_KEY: str = "xNAi4fC6dC6qi5OCTUiE2kn4JKFBlvETmAVEHYZo"
+    OPENWEATHER_URL: str = "http://api.openweathermap.org/data/2.5/weather"
+    NASA_POWER_URL: str = "https://power.larc.nasa.gov/api/temporal/daily/point"
+    SOILGRIDS_URL: str = "https://rest.isric.org/soilgrids/v2.0/properties/query"
+    DEFAULT_TIMEOUT: int = 30
+    MAX_RETRIES: int = 3
+    RETRY_DELAY: int = 2
 
-class FreeSoilAnalyzer:
+@dataclass
+class SoilParameters:
+    """Range configurations for various soil and environmental parameters"""
+    TEMPERATURE_RANGE: Tuple[float, float] = (-50.0, 60.0)
+    HUMIDITY_RANGE: Tuple[float, float] = (0.0, 100.0)
+    PRECIPITATION_RANGE: Tuple[float, float] = (0.0, 500.0)
+    CLAY_RANGE: Tuple[float, float] = (0.0, 100.0)
+    SAND_RANGE: Tuple[float, float] = (0.0, 100.0)
+    SILT_RANGE: Tuple[float, float] = (0.0, 100.0)
+    PH_RANGE: Tuple[float, float] = (3.0, 10.0)
+    ORGANIC_MATTER_RANGE: Tuple[float, float] = (0.0, 30.0)
+    NITROGEN_RANGE: Tuple[float, float] = (0.0, 5.0)
+    MOISTURE_RANGE: Tuple[float, float] = (0.0, 100.0)
+
+class DataValidator:
+    """Validates soil and environmental data against defined ranges"""
+    
+    def __init__(self, parameters: SoilParameters):
+        self.params = parameters
+
+    def validate_range(self, value: Union[float, None], range_tuple: Tuple[float, float], parameter_name: str) -> Tuple[float, bool]:
+        """Validate a value against an acceptable range"""
+        if value is None or np.isnan(value):
+            logger.warning(f"Invalid {parameter_name} value: None or NaN")
+            return range_tuple[0], False
+        
+        try:
+            value = float(value)
+            if range_tuple[0] <= value <= range_tuple[1]:
+                return value, True
+            else:
+                logger.warning(f"{parameter_name} value {value} outside valid range {range_tuple[0]}-{range_tuple[1]}")
+                return max(range_tuple[0], min(range_tuple[1], value)), False
+        except (ValueError, TypeError):
+            logger.warning(f"Could not convert {parameter_name} value to float: {value}")
+            return range_tuple[0], False
+
+    def validate_soil_composition(self, clay: float, sand: float, silt: float) -> Tuple[Dict[str, float], bool]:
+        """Validate and normalize soil composition percentages"""
+        clay_val, clay_valid = self.validate_range(clay, self.params.CLAY_RANGE, "clay")
+        sand_val, sand_valid = self.validate_range(sand, self.params.SAND_RANGE, "sand")
+        silt_val, silt_valid = self.validate_range(silt, self.params.SILT_RANGE, "silt")
+        
+        total = clay_val + sand_val + silt_val
+        if total == 0:
+            logger.warning("All soil composition values are zero")
+            return {"clay": 0.0, "sand": 0.0, "silt": 0.0}, False
+            
+        normalized = {
+            "clay": round((clay_val / total) * 100, 2),
+            "sand": round((sand_val / total) * 100, 2),
+            "silt": round((silt_val / total) * 100, 2)
+        }
+        
+        is_valid = all([clay_valid, sand_valid, silt_valid])
+        return normalized, is_valid
+
+class APIHandler:
+    """Handles API requests with retry logic and error handling"""
+    
     def __init__(self, config: APIConfig):
         self.config = config
-        self.openweather_base_url = "http://api.openweathermap.org/data/2.5"
-        self.nasa_power_url = "https://power.larc.nasa.gov/api/temporal/daily/point"
-        self.soilgrids_url = "https://rest.isric.org/soilgrids/v2.0/properties/query"
+        self.session = requests.Session()
+    
+    def make_request(self, url: str, params: Dict[str, Any], headers: Optional[Dict[str, str]] = None, timeout: Optional[int] = None) -> Tuple[Dict[str, Any], bool]:
+        """Make HTTP request with retry logic and error handling"""
+        timeout = timeout or self.config.DEFAULT_TIMEOUT
+        
+        for attempt in range(self.config.MAX_RETRIES):
+            try:
+                response = self.session.get(url, params=params, headers=headers, timeout=timeout)
+                response.raise_for_status()
+                return response.json(), True
+            except requests.exceptions.RequestException as e:
+                logger.warning(f"Request failed (attempt {attempt + 1}/{self.config.MAX_RETRIES}): {str(e)}")
+                if attempt < self.config.MAX_RETRIES - 1:
+                    time.sleep(self.config.RETRY_DELAY * (attempt + 1))
+                    continue
+                return {}, False
+        
+        return {}, False
 
-    def get_soil_data(self, latitude: float, longitude: float) -> Dict[str, Any]:
-        """Get comprehensive soil data using multiple free APIs."""
+class SoilAnalyzer:
+    """Analyzes soil and environmental conditions based on input data"""
+    
+    def __init__(self):
+        self.config = APIConfig()
+        self.params = SoilParameters()
+        self.validator = DataValidator(self.params)
+        self.api_handler = APIHandler(self.config)
+        
+    def analyze_location(self, latitude: float, longitude: float) -> Dict[str, Any]:
+        """Performs comprehensive soil and environmental analysis for a given location"""
+        if not self._validate_coordinates(latitude, longitude):
+            return self._generate_error_response("Invalid coordinates. Latitude must be between -90 and 90, longitude between -180 and 180.")
+        
         try:
-            # Collect data from multiple sources with validation
             weather_data = self._get_weather_data(latitude, longitude)
-            nasa_data = self._get_nasa_power_data(latitude, longitude)
-            soil_properties = self._get_soilgrids_data(latitude, longitude)
+            nasa_data = self._get_nasa_data(latitude, longitude)
+            soil_data = self._get_soil_data(latitude, longitude)
             
-            # Process data with validation
-            return self._process_soil_data(weather_data, nasa_data, soil_properties)
-        except Exception as e:
-            print(f"Warning: Error during data collection: {str(e)}")
-            return self._generate_fallback_analysis()
-
-    def _get_weather_data(self, lat: float, lon: float) -> Dict[str, Any]:
-        """Get weather data from OpenWeatherMap API with validation."""
-        try:
-            params = {
-                'lat': lat,
-                'lon': lon,
-                'appid': self.config.OPENWEATHER_API_KEY,
-                'units': 'metric'
-            }
-            response = requests.get(
-                f"{self.openweather_base_url}/weather",
-                params=params,
-                timeout=10
-            )
-            response.raise_for_status()
-            return response.json()
-        except Exception as e:
-            print(f"Warning: Weather data retrieval failed: {str(e)}")
-            return {}
-
-    def _get_nasa_power_data(self, lat: float, lon: float) -> Dict[str, Any]:
-        """Get soil and climate data from NASA POWER API with validation."""
-        try:
-            params = {
-                'start': (datetime.now() - timedelta(days=7)).strftime("%Y%m%d"),
-                'end': datetime.now().strftime("%Y%m%d"),
-                'latitude': lat,
-                'longitude': lon,
-                'community': 'AG',
-                'parameters': 'PRECTOT,RH2M,T2M,ALLSKY_SFC_SW_DWN,ALLSKY_SFC_PAR_TOT',
-                'format': 'JSON'
-            }
-            if self.config.NASA_API_KEY:
-                params['api_key'] = self.config.NASA_API_KEY
-
-            response = requests.get(self.nasa_power_url, params=params, timeout=60)
-            response.raise_for_status()
-            return response.json()
-        except Exception as e:
-            print(f"Warning: NASA POWER data retrieval failed: {str(e)}")
-            return {}
-
-    def _get_soilgrids_data(self, lat: float, lon: float) -> Dict[str, Any]:
-        """Get soil properties from SoilGrids API with validation."""
-        try:
-            params = {'lat': lat, 'lon': lon}
-            headers = {'Accept': 'application/json'}
+            analysis = self._process_data(weather_data, nasa_data, soil_data)
+            analysis["timestamp"] = datetime.now().isoformat()
+            analysis["coordinates"] = {"latitude": latitude, "longitude": longitude}
             
-            response = requests.get(
-                self.soilgrids_url,
-                params=params,
-                headers=headers,
-                timeout=10
-            )
-            response.raise_for_status()
-            return response.json()
+            return analysis
         except Exception as e:
-            print(f"Warning: SoilGrids data retrieval failed: {str(e)}")
-            return {}
+            logger.error(f"Analysis failed: {str(e)}")
+            return self._generate_error_response(str(e))
 
-    def _safe_get_nasa_value(self, parameters: Dict, key: str) -> float:
-        """Safely extract and average NASA POWER parameter values."""
-        try:
-            values = parameters.get(key, {})
-            if not values:
-                return 0.0
-            valid_values = [float(v) for v in values.values() if v is not None]
-            return np.mean(valid_values) if valid_values else 0.0
-        except Exception:
-            return 0.0
+    def _get_weather_data(self, lat: float, lon: float) -> Tuple[Dict[str, Any], bool]:
+        """Fetch weather data from OpenWeatherMap API"""
+        params = {'lat': lat, 'lon': lon, 'appid': self.config.OPENWEATHER_API_KEY, 'units': 'metric'}
+        return self.api_handler.make_request(self.config.OPENWEATHER_URL, params)
 
-    def _process_soil_data(
-        self,
-        weather_data: Dict[str, Any],
-        nasa_data: Dict[str, Any],
-        soil_properties: Dict[str, Any]
-    ) -> Dict[str, Any]:
-        """Process and combine data from all sources with validation."""
-        # Extract NASA POWER data with validation
-        nasa_properties = nasa_data.get('properties', {})
-        parameters = nasa_properties.get('parameter', {})
+    def _get_nasa_data(self, lat: float, lon: float) -> Tuple[Dict[str, Any], bool]:
+        """Fetch data from NASA POWER API"""
+        end_date = datetime.now()
+        start_date = end_date - timedelta(days=7)
+        params = {
+            'start': start_date.strftime("%Y%m%d"),
+            'end': end_date.strftime("%Y%m%d"),
+            'latitude': lat,
+            'longitude': lon,
+            'community': 'AG',
+            'parameters': 'PRECTOT,RH2M,T2M,ALLSKY_SFC_SW_DWN',
+            'format': 'JSON'
+        }
         
-        avg_temp = self._safe_get_nasa_value(parameters, 'T2M')
-        avg_precip = self._safe_get_nasa_value(parameters, 'PRECTOT')
-        avg_humidity = self._safe_get_nasa_value(parameters, 'RH2M')
+        if self.config.NASA_API_KEY:
+            params['api_key'] = self.config.NASA_API_KEY
+            
+        return self.api_handler.make_request(self.config.NASA_POWER_URL, params, timeout=60)
+
+    def _get_soil_data(self, lat: float, lon: float) -> Tuple[Dict[str, Any], bool]:
+        """Fetch soil data from SoilGrids API"""
+        params = {'lat': lat, 'lon': lon}
+        headers = {'Accept': 'application/json'}
+        return self.api_handler.make_request(self.config.SOILGRIDS_URL, params, headers)
+
+    def _process_data(self, weather_data: Tuple[Dict[str, Any], bool], nasa_data: Tuple[Dict[str, Any], bool], soil_data: Tuple[Dict[str, Any], bool]) -> Dict[str, Any]:
+        """Combine and process weather, NASA, and soil data"""
+        weather_info, weather_success = weather_data
+        nasa_info, nasa_success = nasa_data
+        soil_info, soil_success = soil_data
         
-        # Extract soil properties with validation
-        soil_layers = soil_properties.get('properties', {}).get('layers', [])
+        env_data = self._process_environmental_data(weather_info, nasa_info)
+        soil_properties = self._process_soil_properties(soil_info)
         
-        # Calculate properties with validation
-        soil_type, soil_properties = self._analyze_soil_properties(soil_layers)
-        moisture_content = self._estimate_moisture_content(
-            avg_precip,
-            avg_temp,
-            avg_humidity,
-            soil_properties
-        )
+        quality_level = self._assess_data_quality(weather_success, nasa_success, soil_success, env_data, soil_properties)
         
         return {
-            "moisture_content": moisture_content,
-            "soil_type": soil_type,
-            "organic_matter": soil_properties['organic_matter'],
-            "ph_level": soil_properties['ph'],
-            "nitrogen_content": soil_properties['nitrogen'],
-            "additional_properties": {
-                "temperature_celsius": round(avg_temp, 2) if avg_temp != 0 else None,
-                "precipitation_mm": round(avg_precip, 2) if avg_precip != 0 else None,
-                "humidity_percent": round(avg_humidity, 2) if avg_humidity != 0 else None,
-                "clay_content_percent": soil_properties['clay'],
-                "sand_content_percent": soil_properties['sand'],
-                "silt_content_percent": soil_properties['silt']
-            },
-            "timestamp": datetime.now().isoformat(),
-            "data_sources": [
-                "OpenWeatherMap API",
-                "NASA POWER API",
-                "ISRIC SoilGrids API"
-            ],
+            "soil_properties": soil_properties,
+            "environmental_conditions": env_data,
+            "soil_type": self._classify_soil_type(soil_properties["composition"]),
             "data_quality": {
-                "weather_data_available": bool(weather_data),
-                "nasa_data_available": bool(nasa_data),
-                "soil_data_available": bool(soil_properties)
+                "level": quality_level.value,
+                "sources_available": {
+                    "weather_data": weather_success,
+                    "nasa_data": nasa_success,
+                    "soil_data": soil_success
+                }
             }
         }
 
-    def _estimate_moisture_content(
-        self,
-        precipitation: float,
-        temperature: float,
-        humidity: float,
-        soil_props: Dict[str, float]
-    ) -> float:
-        """Estimate soil moisture content with validated inputs."""
-        try:
-            # Ensure inputs are within realistic ranges
-            temp_factor = max(0, min(40, temperature)) / 40  # Normalize temperature
-            precip_factor = max(0, min(100, precipitation)) / 100  # Normalize precipitation
-            humidity_factor = max(0, min(100, humidity)) / 100  # Normalize humidity
-            
-            # Calculate base moisture capacity based on soil composition
-            clay_factor = soil_props['clay'] / 100
-            sand_factor = soil_props['sand'] / 100
-            
-            # Clay holds more water than sand
-            base_capacity = (clay_factor * 0.6 + sand_factor * 0.2) * 100
-            
-            # Adjust for environmental factors
-            moisture_content = base_capacity * (
-                0.4 + 0.3 * precip_factor + 0.2 * humidity_factor - 0.1 * temp_factor
-            )
-            
-            return round(max(0, min(100, moisture_content)), 2)
-        except Exception:
-            return 0.0
-
-    def _analyze_soil_properties(
-        self,
-        soil_layers: list
-    ) -> Tuple[str, Dict[str, float]]:
-        """Analyze soil properties with validation."""
-        try:
-            # Get properties with validation
-            clay = max(0, min(100, self._get_layer_property(soil_layers, 'clay')))
-            sand = max(0, min(100, self._get_layer_property(soil_layers, 'sand')))
-            silt = max(0, min(100, 100 - clay - sand))
-            
-            # Normalize percentages to sum to 100
-            total = clay + sand + silt
-            if total > 0:
-                clay = (clay / total) * 100
-                sand = (sand / total) * 100
-                silt = (silt / total) * 100
-            
-            # Get other properties with validation
-            organic_matter = max(0, min(100, self._get_layer_property(soil_layers, 'soc') * 0.058))
-            ph = max(0, min(14, self._get_layer_property(soil_layers, 'phh2o')))
-            if ph == 0:
-                ph = 7.0  # Default to neutral if no data
-            
-            nitrogen = max(0, min(5, organic_matter * 0.05))
-            
-            return self._classify_soil_type(clay, sand, silt), {
-                "clay": round(clay, 2),
-                "sand": round(sand, 2),
-                "silt": round(silt, 2),
-                "organic_matter": round(organic_matter, 2),
-                "ph": round(ph, 2),
-                "nitrogen": round(nitrogen, 3)
-            }
-        except Exception:
-            return "Unknown", self._get_default_properties()
-
-    @staticmethod
-    def _get_layer_property(layers: list, property_name: str, depth_idx: int = 0) -> float:
-        """Safely extract property value from soil layers."""
-        try:
-            return float(layers[depth_idx][property_name]['value'])
-        except (IndexError, KeyError, ValueError, TypeError):
-            return 0.0
-
-    @staticmethod
-    def _classify_soil_type(clay: float, sand: float, silt: float) -> str:
-        """Classify soil type with validation."""
-        if not all(isinstance(x, (int, float)) for x in [clay, sand, silt]):
-            return "Unknown"
+    def _process_environmental_data(self, weather_data: Dict[str, Any], nasa_data: Dict[str, Any]) -> Dict[str, float]:
+        """Process and validate environmental data from weather and NASA"""
+        temp = weather_data.get('main', {}).get('temp', nasa_data.get('properties', {}).get('parameter', {}).get('T2M', {}).get('value'))
+        temp_val, _ = self.validator.validate_range(temp, self.params.TEMPERATURE_RANGE, "temperature")
         
-        if sand >= 85:
-            return "Sandy"
-        elif clay >= 40:
-            return "Clay"
-        elif silt >= 80:
-            return "Silty"
-        elif sand >= 70:
-            return "Sandy Loam"
-        elif clay >= 27 and silt >= 28 and sand <= 45:
-            return "Clay Loam"
-        else:
-            return "Loam"
-
-    @staticmethod
-    def _get_default_properties() -> Dict[str, float]:
-        """Return default soil properties when data is unavailable."""
+        humidity = weather_data.get('main', {}).get('humidity', nasa_data.get('properties', {}).get('parameter', {}).get('RH2M', {}).get('value'))
+        humidity_val, _ = self.validator.validate_range(humidity, self.params.HUMIDITY_RANGE, "humidity")
+        
+        precip = nasa_data.get('properties', {}).get('parameter', {}).get('PRECTOT', {}).get('value', 0)
+        precip_val, _ = self.validator.validate_range(precip, self.params.PRECIPITATION_RANGE, "precipitation")
+        
         return {
-            "clay": 0.0,
-            "sand": 0.0,
-            "silt": 0.0,
-            "organic_matter": 0.0,
-            "ph": 7.0,  # Neutral pH as default
-            "nitrogen": 0.0
+            "temperature_celsius": round(temp_val, 2),
+            "humidity_percent": round(humidity_val, 2),
+            "precipitation_mm": round(precip_val, 2)
         }
 
-    def _generate_fallback_analysis(self) -> Dict[str, Any]:
-        """Generate a fallback analysis when data collection fails."""
+    def _process_soil_properties(self, soil_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Extract and validate soil properties"""
+        layers = soil_data.get('properties', {}).get('layers', [])
+        
+        clay = self._extract_soil_property(layers, 'clay')
+        sand = self._extract_soil_property(layers, 'sand')
+        silt = self._extract_soil_property(layers, 'silt')
+        
+        composition, _ = self.validator.validate_soil_composition(clay, sand, silt)
+        
+        ph = self._extract_soil_property(layers, 'phh2o')
+        ph_val, _ = self.validator.validate_range(ph, self.params.PH_RANGE, "pH")
+        
+        organic = self._extract_soil_property(layers, 'soc')
+        organic_val, _ = self.validator.validate_range(organic, self.params.ORGANIC_MATTER_RANGE, "organic matter")
+        
         return {
-            "moisture_content": 0.0,
-            "soil_type": "Unknown",
-            "organic_matter": 0.0,
-            "ph_level": 7.0,
-            "nitrogen_content": 0.0,
-            "additional_properties": {
-                "temperature_celsius": None,
-                "precipitation_mm": None,
-                "humidity_percent": None,
-                "clay_content_percent": 0.0,
-                "sand_content_percent": 0.0,
-                "silt_content_percent": 0.0
-            },
-            "timestamp": datetime.now().isoformat(),
-            "data_sources": [],
-            "data_quality": {
-                "weather_data_available": False,
-                "nasa_data_available": False,
-                "soil_data_available": False
-            },
+            "composition": composition,
+            "ph": round(ph_val, 2),
+            "organic_matter": round(organic_val, 2)
+        }
+
+    def _extract_soil_property(self, layers: List[Dict], property_name: str) -> float:
+        """Extract and average values for a given soil property"""
+        values = [layer[property_name].get('value', 0) for layer in layers if property_name in layer]
+        return np.mean(values) if values else 0
+
+    def _validate_coordinates(self, lat: float, lon: float) -> bool:
+        """Validate geographic coordinates"""
+        try:
+            lat_float = float(lat)
+            lon_float = float(lon)
+            return -90 <= lat_float <= 90 and -180 <= lon_float <= 180
+        except ValueError:
+            return False
+
+    def _generate_error_response(self, error_message: str) -> Dict[str, Any]:
+        """Standard error response format"""
+        return {
             "status": "error",
-            "message": "Unable to retrieve soil data. Please check your coordinates and try again."
+            "message": error_message,
+            "timestamp": datetime.now().isoformat(),
+            "data_quality": {
+                "level": DataQualityLevel.INSUFFICIENT.value,
+                "sources_available": {
+                    "weather_data": False,
+                    "nasa_data": False,
+                    "soil_data": False
+                }
+            }
         }
 
 def main():
-    config = APIConfig()
-    
-    # Validate API keys
-    if not config.OPENWEATHER_API_KEY:
-        print("Warning: OPENWEATHER_API_KEY not set. Some data may be unavailable.")
-    if not config.NASA_API_KEY:
-        print("Warning: NASA_API_KEY not set. Some data may be unavailable.")
-
-    analyzer = FreeSoilAnalyzer(config)
-    
-    try:
-        latitude = float(input("Enter latitude: "))
-        longitude = float(input("Enter longitude: "))
-        
-        # Validate coordinates
-        if not (-90 <= latitude <= 90) or not (-180 <= longitude <= 180):
-            raise ValueError("Invalid coordinates. Latitude must be between -90 and 90, longitude between -180 and 180.")
-        
-        soil_data = analyzer.get_soil_data(latitude, longitude)
-        print("\nSoil Analysis Results:")
-        print(json.dumps(soil_data, indent=2))
-    except ValueError as e:
-        print(f"Error: {str(e)}")
-    except Exception as e:
-        print(f"Error: An unexpected error occurred: {str(e)}")
+    """Main function to demonstrate usage"""
+    latitude = 40.7128
+    longitude = -74.0060
+    analyzer = SoilAnalyzer()
+    results = analyzer.analyze_location(latitude, longitude)
+    print(json.dumps(results, indent=2))
 
 if __name__ == "__main__":
     main()
