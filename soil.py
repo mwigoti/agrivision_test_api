@@ -79,6 +79,7 @@ def get_soil_moisture_soil_data(lon_min, lat_min, lon_max, lat_max, start_date, 
 lon_min = float(input("Enter minimum longitude: "))
 lat_min = float(input("Enter minimum latitude: "))
 lon_max = float(input("Enter maximum longitude: "))
+
 lat_max = float(input("Enter maximum latitude: "))
 start_date = input("Enter start date (YYYY-MM-DD): ")
 end_date = input("Enter end date (YYYY-MM-DD): ")
