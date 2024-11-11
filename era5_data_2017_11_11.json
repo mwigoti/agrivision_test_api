@@ -1,0 +1,32 @@
+{
+  "metadata": {
+    "timestamp": "2017-11-11T00:00:00",
+    "area": {
+      "north": 0,
+      "east": 36.32,
+      "south": -1.23,
+      "west": 36
+    },
+    "source": "ERA5-Land"
+  },
+  "data": {
+    "soil_temperature_level_1": {
+      "mean": 287.25787353515625,
+      "min": 284.708740234375,
+      "max": 290.302490234375,
+      "unit": "K"
+    },
+    "volumetric_soil_water_layer_1": {
+      "mean": 0.35932353138923645,
+      "min": 0.21873778104782104,
+      "max": 0.4809524416923523,
+      "unit": "m**3 m**-3"
+    },
+    "total_evaporation": {
+      "mean": -0.0029542206320911646,
+      "min": -0.0036073450464755297,
+      "max": -0.002039101906120777,
+      "unit": "m of water equivalent"
+    }
+  }
+}
