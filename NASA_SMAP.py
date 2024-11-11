@@ -26,8 +26,8 @@ class DataQualityLevel(Enum):
 @dataclass
 class APIConfig:
     """Configuration for API access and request handling"""
-    OPENWEATHER_API_KEY: str = "2d3d43c07a7fb4e2d3a6dd20ca5073d0"
-    NASA_API_KEY: str = "xNAi4fC6dC6qi5OCTUiE2kn4JKFBlvETmAVEHYZo"
+    OPENWEATHER_API_KEY: str = "#"
+    NASA_API_KEY: str = #
     OPENWEATHER_URL: str = "http://api.openweathermap.org/data/2.5/weather"
     NASA_POWER_URL: str = "https://power.larc.nasa.gov/api/temporal/daily/point"
     SOILGRIDS_URL: str = "https://rest.isric.org/soilgrids/v2.0/properties/query"
