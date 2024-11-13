@@ -112,12 +112,13 @@ class SoilAnalyzer:
         """Create analysis prompt optimized for Falcon-7B"""
         soil_data_str = json.dumps(soil_data.to_dict(orient='records')[0], indent=2)
         
-        return f"""Instruction: Analyze the following soil data and provide:
+        return f"""Instruction: comprehensively analyze the following soil data and provide:
 1. Soil quality assessment
 2. Crop recommendations
 3. Required amendments
 4. Potential issues
 5. Management recommendations
+
 
 Soil Data:
 {soil_data_str}
